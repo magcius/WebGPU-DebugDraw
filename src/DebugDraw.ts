@@ -287,6 +287,9 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
             },
             vertex: {
                 module: this.shaderModule,
+                constants: {
+                    0: behaviorType,
+                },
                 entryPoint: 'main_vs',
                 buffers: [{
                     attributes: [
