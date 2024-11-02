@@ -1,0 +1,33 @@
+{
+    "compilerOptions": {
+        "target": "es2017",
+        "alwaysStrict": true,
+        "downlevelIteration": true,
+        "esModuleInterop": true,
+        "experimentalDecorators": true,
+        "noImplicitAny": true,
+        "noImplicitOverride": true,
+        "noImplicitReturns": true,
+        "noImplicitThis": true,
+        "strictBindCallApply": true,
+        "strictFunctionTypes": true,
+        "strictNullChecks": true,
+        "useUnknownInCatchVariables": true,
+        "useDefineForClassFields": false,
+        "resolveJsonModule": true,
+        "lib": [
+            "es2017",
+            "es2019.array",
+            "es2021.string",
+            "esnext.BigInt",
+            "dom"
+        ],
+        "sourceMap": true,
+        "moduleResolution": "Bundler",
+        "module": "ESNext"
+    },
+    "include": [
+        "./",
+        "../node_modules/@webgpu/types"
+    ]
+}
