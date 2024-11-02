@@ -1,19 +1,19 @@
 
-import { mat4, ReadonlyMat4, ReadonlyVec3, vec3 } from "gl-matrix";
+import { mat4, ReadonlyMat4, ReadonlyVec3, vec2, vec3 } from "gl-matrix";
 
 interface DebugDrawOptions {
     flags?: DebugDrawFlags;
 };
 
 export const enum DebugDrawFlags {
-    Default = 0,
-
+    // TODO(jstpierre): Implement these?
     WorldSpace = 0,
     ViewSpace = 1 << 0,
     ScreenSpace = 1 << 1,
-    BillboardSpace = 1 << 2,
 
-    DepthTint = 1 << 3,
+    DepthTint = 1 << 2,
+
+    Default = DepthTint,
 };
 
 interface GfxColor {
@@ -73,57 +73,6 @@ enum BehaviorType {
     Count,
 };
 
-const shaderCode = `
-struct ViewData {
-    clip_from_view: mat4x4f,
-    view_from_world: mat4x4f,
-    misc: vec4f,
-};
-
-@id(0) override supports_depth_tint: bool = false;
-
-@group(0) @binding(0) var<uniform> view_data: ViewData;
-@group(0) @binding(1) var depth_buffer: texture_depth_2d;
-
-struct VertexOutput {
-    @builtin(position) position: vec4f,
-    @location(0) color: vec4f,
-    @location(1) @interpolate(flat) flags: u32,
-};
-
-@vertex
-fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f) -> VertexOutput {
-    // Flags are packed in the integer component of the alpha.
-    var flags = u32(color.a);
-
-    var out: VertexOutput;
-    out.position = view_data.clip_from_view * view_data.view_from_world * vec4f(position, 1.0f);
-    out.flags = flags;
-
-    var alpha = 1.0f - fract(color.a);
-    out.color = vec4f(color.rgb * alpha, alpha);
-    return out;
-}
-
-@fragment
-fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
-    var color = vertex.color;
-
-    if (supports_depth_tint) {
-        // Do manual depth testing so we can do a depth tint.
-        if ((vertex.flags & ${DebugDrawFlags.DepthTint}) != 0) {
-            var depth = textureLoad(depth_buffer, vec2u(vertex.position.xy), 0);
-
-            if (depth > vertex.position.z) {
-                color *= 0.2f;
-            }
-        }
-    }
-
-    return color;
-}
-`;
-
 function fillVec3p(d: Float32Array, offs: number, v: ReadonlyVec3): number {
     d[offs + 0] = v[0];
     d[offs + 1] = v[1];
@@ -154,14 +103,16 @@ class BufferPage {
     constructor(device: GPUDevice, public readonly pso: GPURenderPipeline, public readonly behaviorType: BehaviorType, vertexCount: number, indexCount: number) {
         this.vertexData = new Float32Array(vertexCount * this.vertexStride);
         this.vertexBuffer = device.createBuffer({
-            size: this.vertexData.length,
+            size: this.vertexData.byteLength,
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            label: `DebugDraw BufferPage Vertex`,
         });
 
         this.indexData = new Uint16Array(align(indexCount, 2));
         this.indexBuffer = device.createBuffer({
-            size: this.indexData.length >>> 1,
+            size: this.indexData.byteLength,
             usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+            label: `DebugDraw BufferPage Index`,
         });
     }
 
@@ -227,11 +178,12 @@ export class DebugDraw {
     private pipelineLayout: GPUPipelineLayout;
     private uniformBuffer: GPUBuffer;
     private dummyDepthBuffer: GPUTexture;
+    private debugDrawGPU: DebugDrawGPU;
 
     public static scratchVec3 = [vec3.create(), vec3.create(), vec3.create(), vec3.create()];
 
     constructor(private device: GPUDevice, private colorTextureFormat: GPUTextureFormat) {
-        this.shaderModule = device.createShaderModule({ code: shaderCode, label: 'DebugDraw' });
+        this.shaderModule = this.createShaderModule();
         this.uniformBuffer = device.createBuffer({ usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, size: 64+64+16, label: `DebugDraw Uniforms` });
 
         this.bindGroupLayout = device.createBindGroupLayout({
@@ -250,6 +202,66 @@ export class DebugDraw {
             this.pso[i] = this.createPipeline(i);
 
         this.dummyDepthBuffer = device.createTexture({ format: 'depth24plus', size: [1, 1], usage: GPUTextureUsage.TEXTURE_BINDING });
+
+        this.debugDrawGPU = new DebugDrawGPU(this, this.device);
+    }
+
+    public getGPUBuffer(): GPUBuffer {
+        return this.debugDrawGPU.gpuBuffer;
+    }
+
+    private createShaderModule(): GPUShaderModule {
+        const code = `
+struct ViewData {
+    clip_from_view: mat4x4f,
+    view_from_world: mat4x4f,
+    misc: vec4f,
+};
+
+@id(0) override supports_depth_tint: bool = false;
+
+@group(0) @binding(0) var<uniform> view_data: ViewData;
+@group(0) @binding(1) var depth_buffer: texture_depth_2d;
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+    @location(0) color: vec4f,
+    @location(1) @interpolate(flat) flags: u32,
+};
+
+@vertex
+fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f) -> VertexOutput {
+    // Flags are packed in the integer component of the alpha.
+    var flags = u32(color.a);
+
+    var out: VertexOutput;
+    out.position = view_data.clip_from_view * view_data.view_from_world * vec4f(position, 1.0f);
+    out.flags = flags;
+
+    var alpha = 1.0f - fract(color.a);
+    out.color = vec4f(color.rgb * alpha, alpha);
+    return out;
+}
+
+@fragment
+fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
+    var color = vertex.color;
+
+    if (supports_depth_tint) {
+        // Do manual depth testing so we can do a depth tint.
+        if ((vertex.flags & ${DebugDrawFlags.DepthTint}) != 0) {
+            var depth = textureLoad(depth_buffer, vec2u(vertex.position.xy), 0);
+
+            if (depth > vertex.position.z) {
+                color *= 0.2f;
+            }
+        }
+    }
+
+    return color;
+}
+`;
+        return this.device.createShaderModule({ code, label: `DebugDraw` });
     }
 
     private createPipeline(behaviorType: BehaviorType): GPURenderPipeline {
@@ -530,7 +542,13 @@ export class DebugDraw {
         }
     }
 
+    public beginFrame(mouseX: number, mouseY: number, mouseButtons: number): void {
+        this.debugDrawGPU.beginFrame(mouseX, mouseY, mouseButtons);
+    }
+
     public endFrame(cmd: GPUCommandEncoder, clipFromViewMatrix: ReadonlyMat4, viewFromWorldMatrix: ReadonlyMat4, colorTextureView: GPUTextureView, depthTextureView: GPUTextureView): void {
+        this.debugDrawGPU.endFrame(cmd);
+
         const behaviorTypes = this.uploadPages();
         if (behaviorTypes === 0)
             return;
@@ -587,3 +605,161 @@ export class DebugDraw {
             this.pages[i].destroy();
     }
 }
+
+class DebugDrawGPU {
+    private framePool: GPUBuffer[] = [];
+    private submittedFrames: GPUBuffer[] = [];
+    private mouseHoverPos = vec2.fromValues(-1, -1);
+    private mousePressPos = vec2.fromValues(-1, -1);
+    public gpuBuffer: GPUBuffer;
+
+    constructor(private debugDraw: DebugDraw, private device: GPUDevice, private size: number = 8196) {
+        this.gpuBuffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, label: `DebugDrawGPU GPU Buffer` });
+    }
+
+    private parseDebugDrawBuffer(view: DataView): void {
+        const count = view.getUint32(0 * 4, true);
+
+        let offs = 8;
+        for (let i = 0; i < count; i++) {
+            const messageType: DebugDrawMessageType = view.getUint32(offs++ * 4, true);
+            switch (messageType) {
+            case DebugDrawMessageType.drawSphere:
+                {
+                    const p0 = vec3.fromValues(view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true));
+                    const r = view.getFloat32(offs++ * 4, true);
+                    const color = { r: view.getFloat32(offs++ * 4, true), g: view.getFloat32(offs++ * 4, true), b: view.getFloat32(offs++ * 4, true), a: view.getFloat32(offs++ * 4, true) };
+                    this.debugDraw.drawSphereLine(p0, r, color);
+                }
+                break;
+            case DebugDrawMessageType.drawLine:
+                {
+                    const p0 = vec3.fromValues(view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true));
+                    const p1 = vec3.fromValues(view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true));
+                    const color = { r: view.getFloat32(offs++ * 4, true), g: view.getFloat32(offs++ * 4, true), b: view.getFloat32(offs++ * 4, true), a: view.getFloat32(offs++ * 4, true) };
+                    this.debugDraw.drawLine(p0, p1, color);
+                }
+                break;
+            case DebugDrawMessageType.drawBasis:
+                {
+                    const p0 = vec3.fromValues(view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true));
+                    this.debugDraw.drawBasis(mat4.fromTranslation(mat4.create(), p0));
+                }
+                break;
+            }
+        }
+    }
+
+    private updateFromFinishedFrames(): void {
+        for (let i = 0; i < this.submittedFrames.length; i++) {
+            const frame = this.submittedFrames[i];
+            if (frame.mapState === 'unmapped') {
+                frame.mapAsync(GPUMapMode.READ);
+            }
+
+            if (frame.mapState === 'mapped') {
+                const results = new DataView(frame.getMappedRange());
+                this.parseDebugDrawBuffer(results);
+                frame.unmap();
+
+                this.submittedFrames.splice(i--, 1);
+                this.framePool.push(frame);
+            }
+        }
+    }
+
+    private getFrame(): GPUBuffer {
+        if (this.framePool.length > 0)
+            return this.framePool.pop()!;
+        else
+            return this.device.createBuffer({ size: this.size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, label: `DebugDrawGPU CPU Readback Buffer` });
+    }
+
+    public beginFrame(mouseX: number, mouseY: number, mouseButtons: number): void {
+        vec2.set(this.mouseHoverPos, mouseX, mouseY);
+        if (mouseButtons !== 0)
+            vec2.set(this.mousePressPos, mouseX, mouseY);
+
+        // Overwrite the header with new data.
+        const headerData = new Uint32Array(8);
+        headerData[4] = this.mouseHoverPos[0];
+        headerData[5] = this.mouseHoverPos[1];
+        headerData[6] = this.mousePressPos[0];
+        headerData[7] = this.mousePressPos[1];
+        this.device.queue.writeBuffer(this.gpuBuffer, 0, headerData);
+    }
+
+    public endFrame(cmd: GPUCommandEncoder): void {
+        this.updateFromFinishedFrames();
+
+        const readbackFrame = this.getFrame();
+        cmd.copyBufferToBuffer(this.gpuBuffer, 0, readbackFrame, 0, this.size);
+
+        this.submittedFrames.push(readbackFrame);
+    }
+}
+
+const enum DebugDrawMessageType {
+    drawLine,
+    drawSphere,
+    drawBasis,
+}
+
+export const gpuShaderCode = `
+struct DebugDraw_Buffer {
+    @size(16)
+    size: atomic<u32>, // u32 count
+
+    mouse_hover_pos: vec2i, // pixel position of the current mouse
+    mouse_press_pos: vec2i, // pixel position of the last held mouse
+
+    data: array<u32>,
+};
+
+// user code needs to write:
+// @group(x) @binding(y) var<storage, read_write> gDebugDraw_buffer: DebugDraw_Buffer;
+
+fn DebugDraw_getMouseHoverPos() -> vec2i {
+    return gDebugDraw_buffer.mouse_hover_pos;
+}
+
+fn DebugDraw_getMousePressPos() -> vec2i {
+    return gDebugDraw_buffer.mouse_press_pos;
+}
+
+fn DebugDraw_drawLine(p0: vec3f, p1: vec3f, color0: vec4f) {
+    var offs = atomicAdd(&(gDebugDraw_buffer.size), 11);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.drawLine};
+    gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(p0.x);
+    gDebugDraw_buffer.data[offs + 2u] = bitcast<u32>(p0.y);
+    gDebugDraw_buffer.data[offs + 3u] = bitcast<u32>(p0.z);
+    gDebugDraw_buffer.data[offs + 4u] = bitcast<u32>(p1.x);
+    gDebugDraw_buffer.data[offs + 5u] = bitcast<u32>(p1.y);
+    gDebugDraw_buffer.data[offs + 6u] = bitcast<u32>(p1.z);
+    gDebugDraw_buffer.data[offs + 7u] = bitcast<u32>(color0.x);
+    gDebugDraw_buffer.data[offs + 8u] = bitcast<u32>(color0.y);
+    gDebugDraw_buffer.data[offs + 9u] = bitcast<u32>(color0.z);
+    gDebugDraw_buffer.data[offs + 10u] = bitcast<u32>(color0.w);
+}
+
+fn DebugDraw_drawSphere(p0: vec3f, radius: f32, color0: vec4f) {
+    var offs = atomicAdd(&(gDebugDraw_buffer.size), 9u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.drawSphere};
+    gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(p0.x);
+    gDebugDraw_buffer.data[offs + 2u] = bitcast<u32>(p0.y);
+    gDebugDraw_buffer.data[offs + 3u] = bitcast<u32>(p0.z);
+    gDebugDraw_buffer.data[offs + 4u] = bitcast<u32>(radius);
+    gDebugDraw_buffer.data[offs + 5u] = bitcast<u32>(color0.x);
+    gDebugDraw_buffer.data[offs + 6u] = bitcast<u32>(color0.y);
+    gDebugDraw_buffer.data[offs + 7u] = bitcast<u32>(color0.z);
+    gDebugDraw_buffer.data[offs + 8u] = bitcast<u32>(color0.w);
+}
+
+fn DebugDraw_drawBasis(p0: vec3f) {
+    var offs = atomicAdd(&(gDebugDraw_buffer.size), 4u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.drawBasis};
+    gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(p0.x);
+    gDebugDraw_buffer.data[offs + 2u] = bitcast<u32>(p0.y);
+    gDebugDraw_buffer.data[offs + 3u] = bitcast<u32>(p0.z);
+}
+`;
