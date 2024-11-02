@@ -181,6 +181,7 @@ class FontTexture {
     public cellHeight: number;
     public advanceX: number;
     public advanceY: number;
+    public strokeWidth = 3;
     public padding: number = 1;
     public numCellsPerRow: number;
     public fontParams = new Float32Array(4);
@@ -228,18 +229,19 @@ class FontTexture {
         this.advanceY = cellHeight;
 
         // Padding
-        cellWidth += this.padding * 2;
-        cellHeight += this.padding * 2;
+        const extra = this.padding + this.strokeWidth * 0.5;
+        cellWidth += extra * 2;
+        cellHeight += extra * 2;
 
         ctx.strokeStyle = `rgba(255, 255, 255, 0.5)`;
-        ctx.lineWidth = 3;
+        ctx.lineWidth = this.strokeWidth;
         ctx.fillStyle = `rgba(255, 255, 255, 1.0)`;
         const numCellsPerRow = (canvas.width / cellWidth) | 0;
         let cellY = 0;
         let cellX = 0;
         for (const char of this.characters) {
-            ctx.strokeText(char, cellX * cellWidth + this.padding, cellY * cellHeight + this.padding);
-            ctx.fillText(char, cellX * cellWidth + this.padding, cellY * cellHeight + this.padding);
+            ctx.strokeText(char, cellX * cellWidth + extra, cellY * cellHeight + extra);
+            ctx.fillText(char, cellX * cellWidth + extra, cellY * cellHeight + extra);
             cellX++;
     
             if (cellX === numCellsPerRow) {

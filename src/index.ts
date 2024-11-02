@@ -187,8 +187,8 @@ class Main {
 
     constructor() {
         this.canvas = document.createElement('canvas');
-        this.canvas.width = 800;
-        this.canvas.height = 600;
+        this.canvas.width = 1920;
+        this.canvas.height = 1080;
 
         document.body.appendChild(this.canvas);
 
