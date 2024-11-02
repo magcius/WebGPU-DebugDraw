@@ -179,6 +179,7 @@ export class DebugDraw {
     private uniformBuffer: GPUBuffer;
     private dummyDepthBuffer: GPUTexture;
     private debugDrawGPU: DebugDrawGPU;
+    private lineThickness = 3;
 
     public static scratchVec3 = [vec3.create(), vec3.create(), vec3.create(), vec3.create()];
 
@@ -189,7 +190,7 @@ export class DebugDraw {
         this.bindGroupLayout = device.createBindGroupLayout({
             entries: [
                 { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
+                { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
             ],
             label: 'DebugDraw',
         });
@@ -198,7 +199,7 @@ export class DebugDraw {
             label: 'DebugDraw',
         });
 
-        for (let i = 0; i <= BehaviorType.Count; i++)
+        for (let i = 0; i < BehaviorType.Count; i++)
             this.pso[i] = this.createPipeline(i);
 
         this.dummyDepthBuffer = device.createTexture({ format: 'depth24plus', size: [1, 1], usage: GPUTextureUsage.TEXTURE_BINDING });
@@ -218,7 +219,7 @@ struct ViewData {
     misc: vec4f,
 };
 
-@id(0) override supports_depth_tint: bool = false;
+@id(0) override behavior_type: u32 = ${BehaviorType.Lines};
 
 @group(0) @binding(0) var<uniform> view_data: ViewData;
 @group(0) @binding(1) var depth_buffer: texture_depth_2d;
@@ -230,14 +231,27 @@ struct VertexOutput {
 };
 
 @vertex
-fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f) -> VertexOutput {
+fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f, @builtin(instance_index) instance_index: u32) -> VertexOutput {
     // Flags are packed in the integer component of the alpha.
     var flags = u32(color.a);
 
     var out: VertexOutput;
     out.position = view_data.clip_from_view * view_data.view_from_world * vec4f(position, 1.0f);
-    out.flags = flags;
 
+    if (behavior_type == ${BehaviorType.Lines}) {
+        // Hacky thick line support.
+        if (instance_index >= 1) {
+            var line_idx = instance_index - 1;
+            var offs: vec2f;
+            offs.x = select(1.0f, -1.0f, (line_idx & 1u) != 0u);
+            offs.y = select(1.0f, -1.0f, (line_idx & 2u) != 0u);
+            offs *= f32((line_idx / 4) + 1);
+
+            out.position += vec4f(offs / vec2f(textureDimensions(depth_buffer)), 0.0f, 0.0f) * out.position.w;
+        }
+    }
+
+    out.flags = flags;
     var alpha = 1.0f - fract(color.a);
     out.color = vec4f(color.rgb * alpha, alpha);
     return out;
@@ -247,7 +261,7 @@ fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f) -> VertexOut
 fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     var color = vertex.color;
 
-    if (supports_depth_tint) {
+    if (behavior_type != ${BehaviorType.Opaque}) {
         // Do manual depth testing so we can do a depth tint.
         if ((vertex.flags & ${DebugDrawFlags.DepthTint}) != 0) {
             var depth = textureLoad(depth_buffer, vec2u(vertex.position.xy), 0);
@@ -285,7 +299,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
             fragment: {
                 module: this.shaderModule,
                 constants: {
-                    0: (behaviorType !== BehaviorType.Opaque) ? 1 : 0,
+                    0: behaviorType,
                 },
                 entryPoint: 'main_ps',
                 targets: [{ format: this.colorTextureFormat, blend: {
@@ -535,7 +549,9 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
             pass.setPipeline(page.pso);
             pass.setVertexBuffer(0, page.vertexBuffer);
             pass.setIndexBuffer(page.indexBuffer, 'uint16');
-            pass.drawIndexed(indexCount);
+
+            const instanceCount = behaviorType === BehaviorType.Lines ? 1 + (this.lineThickness - 1) * 4 : 1;
+            pass.drawIndexed(indexCount, instanceCount);
 
             // Reset for next frame.
             page.endFrame();
