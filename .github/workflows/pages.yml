@@ -38,6 +38,8 @@ jobs:
           version: 7
       - name: Setup Pages
         uses: actions/configure-pages@v3
+      - name: Install Node dependencies
+        run: pnpm install
       - name: Build Parcel
         run: pnpm parcel build --public-url=. index.html
       - name: Upload artifact
