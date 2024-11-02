@@ -141,6 +141,10 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
         DebugDraw_drawSphere(vertex.world_position.xyz, 1.0f, vec4f(0.0f, 1.0f, 0.0f, 1.0f));
     }
 
+    if (all(DebugDraw_getMousePressPos().xy == vec2i(vertex.position.xy))) {
+        DebugDraw_drawLocator(vertex.world_position.xyz, 0.5f, vec4f(0.0f, 0.0f, 1.0f, 1.0f));
+    }
+
     return color;
 }
 `;
@@ -261,7 +265,7 @@ class Main {
         // DebugDraw example.
         const time = window.performance.now();
         this.debugDraw.drawSphereLine(vec3.fromValues(Math.sin(time / 200) * 1.5, Math.sin(time / 300) * 0.2, Math.sin(time / 300 + 400)), 1, Red, 32, { flags: DebugDrawFlags.DepthTint });
-        this.debugDraw.endFrame(cmd, this.clipFromViewMatrix, this.viewFromWorldMatrix, colorTexture.createView(), this.depthBuffer.createView());
+        this.debugDraw.endFrame(cmd, this.clipFromViewMatrix, this.viewFromWorldMatrix, this.canvas.width, this.canvas.height, colorTexture.createView(), this.depthBuffer.createView());
 
         this.device.queue.submit([cmd.finish()]);
 

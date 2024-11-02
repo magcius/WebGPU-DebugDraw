@@ -2,7 +2,7 @@
 import { mat4, ReadonlyMat4, ReadonlyVec3, vec2, vec3 } from "gl-matrix";
 
 interface DebugDrawOptions {
-    flags?: DebugDrawFlags;
+    flags: DebugDrawFlags;
 };
 
 export const enum DebugDrawFlags {
@@ -15,6 +15,8 @@ export const enum DebugDrawFlags {
 
     Default = DepthTint,
 };
+
+const SpaceMask = DebugDrawFlags.WorldSpace | DebugDrawFlags.ViewSpace | DebugDrawFlags.ScreenSpace;
 
 interface GfxColor {
     r: number;
@@ -67,9 +69,10 @@ function getMatrixAxisZ(dst: vec3, m: ReadonlyMat4): void {
 }
 
 enum BehaviorType {
-    Lines,
-    Opaque,
-    Transparent,
+    LinesDepthWrite,
+    LinesDepthTint,
+    SolidDepthWrite,
+    SolidDepthTint,
     Count,
 };
 
@@ -127,7 +130,7 @@ class BufferPage {
 
     public vertexPCF(v: ReadonlyVec3, c: GfxColor, options: DebugDrawOptions): void {
         this.vertexDataOffs += fillVec3p(this.vertexData, this.vertexDataOffs, v);
-        let flags = options.flags ?? DebugDrawFlags.Default;
+        const flags = options.flags;
         // encode flags in alpha
         const alpha = (1.0 - c.a) + flags;
         this.vertexDataOffs += fillColor(this.vertexData, this.vertexDataOffs, c, alpha);
@@ -219,7 +222,7 @@ struct ViewData {
     misc: vec4f,
 };
 
-@id(0) override behavior_type: u32 = ${BehaviorType.Lines};
+@id(0) override behavior_type: u32 = ${BehaviorType.LinesDepthWrite};
 
 @group(0) @binding(0) var<uniform> view_data: ViewData;
 @group(0) @binding(1) var depth_buffer: texture_depth_2d;
@@ -227,7 +230,7 @@ struct ViewData {
 struct VertexOutput {
     @builtin(position) position: vec4f,
     @location(0) color: vec4f,
-    @location(1) @interpolate(flat) flags: u32,
+    @location(1) @interpolate(flat, either) flags: u32,
 };
 
 @vertex
@@ -236,9 +239,18 @@ fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f, @builtin(ins
     var flags = u32(color.a);
 
     var out: VertexOutput;
-    out.position = view_data.clip_from_view * view_data.view_from_world * vec4f(position, 1.0f);
 
-    if (behavior_type == ${BehaviorType.Lines}) {
+    var space = flags & ${SpaceMask};
+    if (space == ${DebugDrawFlags.WorldSpace}) {
+        out.position = view_data.clip_from_view * view_data.view_from_world * vec4f(position, 1.0f);
+    } else if (space == ${DebugDrawFlags.ViewSpace}) {
+        out.position = view_data.clip_from_view * vec4f(position, 1.0f);
+    } else if (space == ${DebugDrawFlags.ScreenSpace}) {
+        // Same as view-space, but we drop Z on the floor.
+        out.position = view_data.clip_from_view * vec4f(position.xy, 0.0f, 1.0f);
+    }
+
+    if (behavior_type == ${BehaviorType.LinesDepthTint} || behavior_type == ${BehaviorType.LinesDepthWrite}) {
         // Hacky thick line support.
         if (instance_index >= 1) {
             var line_idx = instance_index - 1;
@@ -247,7 +259,8 @@ fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f, @builtin(ins
             offs.y = select(1.0f, -1.0f, (line_idx & 2u) != 0u);
             offs *= f32((line_idx / 4) + 1);
 
-            out.position += vec4f(offs / vec2f(textureDimensions(depth_buffer)), 0.0f, 0.0f) * out.position.w;
+            var inv_screen_size = view_data.misc.xy;
+            out.position += vec4f(offs * inv_screen_size, 0.0f, 0.0f) * out.position.w;
         }
     }
 
@@ -261,14 +274,12 @@ fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f, @builtin(ins
 fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     var color = vertex.color;
 
-    if (behavior_type != ${BehaviorType.Opaque}) {
+    if (behavior_type == ${BehaviorType.LinesDepthTint} || behavior_type == ${BehaviorType.SolidDepthTint}) {
         // Do manual depth testing so we can do a depth tint.
-        if ((vertex.flags & ${DebugDrawFlags.DepthTint}) != 0) {
-            var depth = textureLoad(depth_buffer, vec2u(vertex.position.xy), 0);
+        var depth = textureLoad(depth_buffer, vec2u(vertex.position.xy), 0);
 
-            if (depth > vertex.position.z) {
-                color *= 0.2f;
-            }
+        if (depth > vertex.position.z) {
+            color *= 0.15f;
         }
     }
 
@@ -280,10 +291,12 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
 
     private createPipeline(behaviorType: BehaviorType): GPURenderPipeline {
         // Create the PSO based on our state.
+        const isLines = behaviorType === BehaviorType.LinesDepthWrite || behaviorType === BehaviorType.LinesDepthTint;
+        const isDepthTint = behaviorType === BehaviorType.LinesDepthTint || behaviorType === BehaviorType.SolidDepthTint;
         const desc: GPURenderPipelineDescriptor = {
             layout: this.pipelineLayout,
             primitive: {
-                topology: behaviorType === BehaviorType.Lines ? 'line-list' : 'triangle-list',
+                topology: isLines ? 'line-list' : 'triangle-list',
             },
             vertex: {
                 module: this.shaderModule,
@@ -310,24 +323,32 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
                     alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha', },
                 } }],
             },
-            depthStencil: behaviorType === BehaviorType.Opaque ? {
+            depthStencil: isDepthTint ? undefined : {
                 format: 'depth24plus',
                 depthCompare: 'greater',
                 depthWriteEnabled: true,
-            } : undefined,
+            },
             label: `DebugDraw ${BehaviorType[behaviorType]}`,
         };
 
         return this.device.createRenderPipeline(desc);
     }
 
+    private getBehaviorType(isLines: boolean, options: DebugDrawOptions) {
+        const isDepthTint = options.flags & DebugDrawFlags.DepthTint;
+        if (isLines)
+            return isDepthTint ? BehaviorType.LinesDepthTint : BehaviorType.LinesDepthWrite;
+        else
+            return isDepthTint ? BehaviorType.SolidDepthTint : BehaviorType.SolidDepthWrite;
+    }
+
     private beginBatch(behaviorType: BehaviorType, vertexCount: number, indexCount: number): void {
-        assert(this.currentPage === null);
         this.currentPage = this.findPage(behaviorType, vertexCount, indexCount);
     }
 
-    public beginBatchLine(numSegments: number): void {
-        this.beginBatch(BehaviorType.Lines, numSegments * 2, numSegments * 2);
+    public beginBatchLine(numSegments: number, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
+        const behaviorType = this.getBehaviorType(true, options);
+        this.beginBatch(behaviorType, numSegments * 2, numSegments * 2);
     }
 
     public endBatch(): void {
@@ -356,7 +377,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawLine(p0: ReadonlyVec3, p1: ReadonlyVec3, color0: GfxColor, color1 = color0, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(BehaviorType.Lines, 2, 2);
+        const page = this.findPage(this.getBehaviorType(true, options), 2, 2);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(p0, color0, options);
@@ -372,7 +393,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawBasis(m: ReadonlyMat4, mag = 100, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(BehaviorType.Lines, 6, 6);
+        const page = this.findPage(this.getBehaviorType(true, options), 6, 6);
 
         const baseVertex = page.getCurrentVertexID();
         mat4.getTranslation(DebugDraw.scratchVec3[0], m);
@@ -399,13 +420,31 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
             page.index(baseVertex + i);
     }
 
+    public drawLocator(center: ReadonlyVec3, mag: number, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
+        const page = this.findPage(this.getBehaviorType(true, options), 6, 6);
+
+        const baseVertex = page.getCurrentVertexID();
+        for (let i = 0; i < 3; i++) {
+            vec3.copy(DebugDraw.scratchVec3[0], center);
+            vec3.copy(DebugDraw.scratchVec3[1], center);
+            DebugDraw.scratchVec3[0][i] -= mag;
+            DebugDraw.scratchVec3[1][i] += mag;
+
+            page.vertexPCF(DebugDraw.scratchVec3[0], color, options);
+            page.vertexPCF(DebugDraw.scratchVec3[1], color, options);
+        }
+
+        for (let i = 0; i < 6; i++)
+            page.index(baseVertex + i);
+    }
+
     public drawDiscLineN(center: ReadonlyVec3, n: ReadonlyVec3, r: number, color: GfxColor, sides = 32, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
         branchlessONB(DebugDraw.scratchVec3[0], DebugDraw.scratchVec3[1], n);
         this.drawDiscSolidRU(center, DebugDraw.scratchVec3[0], DebugDraw.scratchVec3[1], r, color, sides, options);
     }
 
     public drawDiscLineRU(center: ReadonlyVec3, right: ReadonlyVec3, up: ReadonlyVec3, r: number, color: GfxColor, sides = 32, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(BehaviorType.Lines, sides, sides * 2);
+        const page = this.findPage(this.getBehaviorType(true, options), sides, sides * 2);
 
         const baseVertex = page.getCurrentVertexID();
         const s = DebugDraw.scratchVec3[2];
@@ -434,8 +473,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawDiscSolidRU(center: ReadonlyVec3, right: ReadonlyVec3, up: ReadonlyVec3, r: number, color: GfxColor, sides = 32, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const behaviorType = color.a < 1.0 ? BehaviorType.Transparent : BehaviorType.Opaque;
-        const page = this.findPage(behaviorType, sides + 1, sides * 3);
+        const page = this.findPage(this.getBehaviorType(false, options), sides + 1, sides * 3);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(center, color, options);
@@ -473,8 +511,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawTriSolidP(p0: ReadonlyVec3, p1: ReadonlyVec3, p2: ReadonlyVec3, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const behaviorType = color.a < 1.0 ? BehaviorType.Transparent : BehaviorType.Opaque;
-        const page = this.findPage(behaviorType, 3, 3);
+        const page = this.findPage(this.getBehaviorType(false, options), 3, 3);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(p0, color, options);
@@ -486,7 +523,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawRectLineP(p0: ReadonlyVec3, p1: ReadonlyVec3, p2: ReadonlyVec3, p3: ReadonlyVec3, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(BehaviorType.Lines, 4, 8);
+        const page = this.findPage(this.getBehaviorType(true, options), 4, 8);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(p0, color, options);
@@ -506,8 +543,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawRectSolidP(p0: ReadonlyVec3, p1: ReadonlyVec3, p2: ReadonlyVec3, p3: ReadonlyVec3, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const behaviorType = color.a < 1.0 ? BehaviorType.Transparent : BehaviorType.Opaque;
-        const page = this.findPage(behaviorType, 4, 6);
+        const page = this.findPage(this.getBehaviorType(false, options), 4, 6);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(p0, color, options);
@@ -539,10 +575,10 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
         return types;
     }
 
-    private drawPages(pass: GPURenderPassEncoder, behaviorType: BehaviorType): void {
+    private drawPages(pass: GPURenderPassEncoder, behaviorTypes: number): void {
         for (let i = 0; i < this.pages.length; i++) {
             const page = this.pages[i];
-            if (page.behaviorType !== behaviorType)
+            if (!((1 << page.behaviorType) & behaviorTypes))
                 continue;
 
             const indexCount = page.getDrawCount();
@@ -553,7 +589,8 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
             pass.setVertexBuffer(0, page.vertexBuffer);
             pass.setIndexBuffer(page.indexBuffer, 'uint16');
 
-            const instanceCount = behaviorType === BehaviorType.Lines ? 1 + (this.lineThickness - 1) * 4 : 1;
+            const isLines = page.behaviorType === BehaviorType.LinesDepthWrite || page.behaviorType === BehaviorType.LinesDepthTint;
+            const instanceCount = isLines ? 1 + (this.lineThickness - 1) * 4 : 1;
             pass.drawIndexed(indexCount, instanceCount);
 
             // Reset for next frame.
@@ -565,7 +602,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
         this.debugDrawGPU.beginFrame(mouseX, mouseY, mouseButtons);
     }
 
-    public endFrame(cmd: GPUCommandEncoder, clipFromViewMatrix: ReadonlyMat4, viewFromWorldMatrix: ReadonlyMat4, colorTextureView: GPUTextureView, depthTextureView: GPUTextureView): void {
+    public endFrame(cmd: GPUCommandEncoder, clipFromViewMatrix: ReadonlyMat4, viewFromWorldMatrix: ReadonlyMat4, width: number, height: number, colorTextureView: GPUTextureView, depthTextureView: GPUTextureView): void {
         this.debugDrawGPU.endFrame(cmd);
 
         const behaviorTypes = this.uploadPages();
@@ -575,46 +612,49 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
         const data = new Float32Array(this.uniformBuffer.size / 4);
         data.set(clipFromViewMatrix, 0);
         data.set(viewFromWorldMatrix, 16);
+        data[32] = 1 / width;
+        data[33] = 1 / height;
         this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
 
         // First, check if we have any solid stuff (needs proper depth).
-        if (behaviorTypes & (1 << BehaviorType.Opaque)) {
+        if (behaviorTypes & ((1 << BehaviorType.LinesDepthWrite) | (1 << BehaviorType.SolidDepthWrite))) {
             const bindGroup = this.device.createBindGroup({
                 layout: this.bindGroupLayout,
                 entries: [
                     { binding: 0, resource: { buffer: this.uniformBuffer } },
                     { binding: 1, resource: this.dummyDepthBuffer.createView() },
                 ],
-                label: `DebugDraw`,
+                label: `DebugDraw DepthWrite`,
             });
 
             const renderPass = cmd.beginRenderPass({
                 colorAttachments: [{ view: colorTextureView, loadOp: 'load', storeOp: 'store' }],
                 depthStencilAttachment: { view: depthTextureView, depthLoadOp: 'load', depthStoreOp: 'store' },
+                label: `DebugDraw DepthTint`,
             });
 
             renderPass.setBindGroup(0, bindGroup);
-            this.drawPages(renderPass, BehaviorType.Opaque);
+            this.drawPages(renderPass, (1 << BehaviorType.LinesDepthWrite) | (1 << BehaviorType.SolidDepthWrite));
             renderPass.end();
         }
 
-        if (behaviorTypes & ((1 << BehaviorType.Transparent) | (1 << BehaviorType.Lines))) {
+        if (behaviorTypes & ((1 << BehaviorType.LinesDepthTint) | (1 << BehaviorType.SolidDepthTint))) {
             const bindGroup = this.device.createBindGroup({
                 layout: this.bindGroupLayout,
                 entries: [
                     { binding: 0, resource: { buffer: this.uniformBuffer } },
                     { binding: 1, resource: depthTextureView },
                 ],
-                label: `DebugDraw`,
+                label: `DebugDraw DepthTint`,
             });
 
             const renderPass = cmd.beginRenderPass({
                 colorAttachments: [{ view: colorTextureView, loadOp: 'load', storeOp: 'store' }],
+                label: `DebugDraw DepthTint`,
             });
 
             renderPass.setBindGroup(0, bindGroup);
-            this.drawPages(renderPass, BehaviorType.Transparent);
-            this.drawPages(renderPass, BehaviorType.Lines);
+            this.drawPages(renderPass, (1 << BehaviorType.LinesDepthTint) | (1 << BehaviorType.SolidDepthTint));
             renderPass.end();
         }
     }
@@ -639,16 +679,33 @@ class DebugDrawGPU {
     private parseDebugDrawBuffer(view: DataView): void {
         const count = view.getUint32(0 * 4, true);
 
+        let flags: DebugDrawFlags = DebugDrawFlags.Default;
+
         let offs = 8;
-        for (let i = 0; i < count; i++) {
+        const end = offs + count;
+        while (offs < end) {
             const messageType: DebugDrawMessageType = view.getUint32(offs++ * 4, true);
             switch (messageType) {
+            case DebugDrawMessageType.setDepthTint:
+                {
+                    const v = !!view.getUint32(offs++ * 4, true);
+                    flags &= ~DebugDrawFlags.DepthTint;
+                    flags |= v ? DebugDrawFlags.DepthTint : 0;
+                }
+                break;
+            case DebugDrawMessageType.setSpace:
+                {
+                    const space = view.getUint32(offs++ * 4, true);
+                    flags &= ~SpaceMask;
+                    flags |= space;
+                }
+                break;
             case DebugDrawMessageType.drawSphere:
                 {
                     const p0 = vec3.fromValues(view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true));
                     const r = view.getFloat32(offs++ * 4, true);
                     const color = { r: view.getFloat32(offs++ * 4, true), g: view.getFloat32(offs++ * 4, true), b: view.getFloat32(offs++ * 4, true), a: view.getFloat32(offs++ * 4, true) };
-                    this.debugDraw.drawSphereLine(p0, r, color);
+                    this.debugDraw.drawSphereLine(p0, r, color, 32, { flags });
                 }
                 break;
             case DebugDrawMessageType.drawLine:
@@ -656,15 +713,26 @@ class DebugDrawGPU {
                     const p0 = vec3.fromValues(view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true));
                     const p1 = vec3.fromValues(view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true));
                     const color = { r: view.getFloat32(offs++ * 4, true), g: view.getFloat32(offs++ * 4, true), b: view.getFloat32(offs++ * 4, true), a: view.getFloat32(offs++ * 4, true) };
-                    this.debugDraw.drawLine(p0, p1, color);
+                    this.debugDraw.drawLine(p0, p1, color, color, { flags });
                 }
                 break;
-            case DebugDrawMessageType.drawBasis:
+            case DebugDrawMessageType.drawLocator:
                 {
                     const p0 = vec3.fromValues(view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true), view.getFloat32(offs++ * 4, true));
-                    this.debugDraw.drawBasis(mat4.fromTranslation(mat4.create(), p0));
+                    const mag = view.getFloat32(offs++ * 4, true);
+                    const color = { r: view.getFloat32(offs++ * 4, true), g: view.getFloat32(offs++ * 4, true), b: view.getFloat32(offs++ * 4, true), a: view.getFloat32(offs++ * 4, true) };
+                    this.debugDraw.drawLocator(p0, mag, color, { flags });
                 }
                 break;
+            }
+        }
+    }
+
+    private mapSubmittedFrames(): void {
+        for (let i = 0; i < this.submittedFrames.length; i++) {
+            const frame = this.submittedFrames[i];
+            if (frame.mapState === 'unmapped') {
+                frame.mapAsync(GPUMapMode.READ);
             }
         }
     }
@@ -672,10 +740,6 @@ class DebugDrawGPU {
     private updateFromFinishedFrames(): void {
         for (let i = 0; i < this.submittedFrames.length; i++) {
             const frame = this.submittedFrames[i];
-            if (frame.mapState === 'unmapped') {
-                frame.mapAsync(GPUMapMode.READ);
-            }
-
             if (frame.mapState === 'mapped') {
                 const results = new DataView(frame.getMappedRange());
                 this.parseDebugDrawBuffer(results);
@@ -695,6 +759,8 @@ class DebugDrawGPU {
     }
 
     public beginFrame(mouseX: number, mouseY: number, mouseButtons: number): void {
+        this.mapSubmittedFrames();
+
         vec2.set(this.mouseHoverPos, mouseX, mouseY);
         if (mouseButtons !== 0)
             vec2.set(this.mousePressPos, mouseX, mouseY);
@@ -709,6 +775,7 @@ class DebugDrawGPU {
     }
 
     public endFrame(cmd: GPUCommandEncoder): void {
+        this.mapSubmittedFrames();
         this.updateFromFinishedFrames();
 
         const readbackFrame = this.getFrame();
@@ -719,9 +786,11 @@ class DebugDrawGPU {
 }
 
 const enum DebugDrawMessageType {
+    setDepthTint,
+    setSpace,
     drawLine,
     drawSphere,
-    drawBasis,
+    drawLocator,
 }
 
 export const gpuShaderCode = `
@@ -746,8 +815,46 @@ fn DebugDraw_getMousePressPos() -> vec2i {
     return gDebugDraw_buffer.mouse_press_pos;
 }
 
+/**
+ * Sets all future debug draws to use depth tinting (if v is true), or traditional depth testing (if v is false).
+ */
+fn DebugDraw_setDepthTint(v: bool) {
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 2u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.setDepthTint};
+    gDebugDraw_buffer.data[offs + 1u] = select(0u, 1u, v);
+}
+
+/**
+ * Sets all future debug draws to use a world-space coordinate system.
+ */
+fn DebugDraw_setWorldSpace() {
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 2u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.setSpace};
+    gDebugDraw_buffer.data[offs + 1u] = ${DebugDrawFlags.WorldSpace};
+}
+
+/**
+ * Sets all future debug draws to use a view-space coordinate system,
+ * where +z points towards the camera.
+ */
+fn DebugDraw_setViewSpace() {
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 2u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.setSpace};
+    gDebugDraw_buffer.data[offs + 1u] = ${DebugDrawFlags.ViewSpace};
+}
+
+/**
+ * Sets all future debug draws to use a screen-space coordinate system,
+ * where all draws are at the near plane, and x and y range from -1,1 (top left) to 1,1 (bottom right).
+ */
+fn DebugDraw_setScreenSpace() {
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 2u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.setSpace};
+    gDebugDraw_buffer.data[offs + 1u] = ${DebugDrawFlags.ScreenSpace};
+}
+
 fn DebugDraw_drawLine(p0: vec3f, p1: vec3f, color0: vec4f) {
-    var offs = atomicAdd(&(gDebugDraw_buffer.size), 11);
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 11u);
     gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.drawLine};
     gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(p0.x);
     gDebugDraw_buffer.data[offs + 2u] = bitcast<u32>(p0.y);
@@ -762,7 +869,7 @@ fn DebugDraw_drawLine(p0: vec3f, p1: vec3f, color0: vec4f) {
 }
 
 fn DebugDraw_drawSphere(p0: vec3f, radius: f32, color0: vec4f) {
-    var offs = atomicAdd(&(gDebugDraw_buffer.size), 9u);
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 9u);
     gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.drawSphere};
     gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(p0.x);
     gDebugDraw_buffer.data[offs + 2u] = bitcast<u32>(p0.y);
@@ -774,11 +881,16 @@ fn DebugDraw_drawSphere(p0: vec3f, radius: f32, color0: vec4f) {
     gDebugDraw_buffer.data[offs + 8u] = bitcast<u32>(color0.w);
 }
 
-fn DebugDraw_drawBasis(p0: vec3f) {
-    var offs = atomicAdd(&(gDebugDraw_buffer.size), 4u);
-    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.drawBasis};
+fn DebugDraw_drawLocator(p0: vec3f, mag: f32, color0: vec4f) {
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 9u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.drawLocator};
     gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(p0.x);
     gDebugDraw_buffer.data[offs + 2u] = bitcast<u32>(p0.y);
     gDebugDraw_buffer.data[offs + 3u] = bitcast<u32>(p0.z);
+    gDebugDraw_buffer.data[offs + 4u] = bitcast<u32>(mag);
+    gDebugDraw_buffer.data[offs + 5u] = bitcast<u32>(color0.x);
+    gDebugDraw_buffer.data[offs + 6u] = bitcast<u32>(color0.y);
+    gDebugDraw_buffer.data[offs + 7u] = bitcast<u32>(color0.z);
+    gDebugDraw_buffer.data[offs + 8u] = bitcast<u32>(color0.w);
 }
 `;
