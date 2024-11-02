@@ -1,12 +1,11 @@
 
-import { mat4, ReadonlyMat4, ReadonlyVec3, vec2, vec3 } from "gl-matrix";
+import { mat4, ReadonlyMat4, ReadonlyVec3, vec2, vec3, vec4 } from "gl-matrix";
 
 interface DebugDrawOptions {
     flags: DebugDrawFlags;
 };
 
 export const enum DebugDrawFlags {
-    // TODO(jstpierre): Implement these?
     WorldSpace = 0,
     ViewSpace = 1 << 0,
     ScreenSpace = 1 << 1,
@@ -49,6 +48,7 @@ function branchlessONB(dstA: vec3, dstB: vec3, n: ReadonlyVec3): void {
 export const Red = { r: 1, g: 0, b: 0, a: 1 };
 export const Green = { r: 0, g: 1, b: 0, a: 1 };
 export const Blue = { r: 0, g: 0, b: 1, a: 1 };
+export const White = { r: 1, g: 1, b: 1, a: 1 };
 
 const TAU = Math.PI * 2;
 
@@ -69,10 +69,13 @@ function getMatrixAxisZ(dst: vec3, m: ReadonlyMat4): void {
 }
 
 enum BehaviorType {
+    Lines,
     LinesDepthWrite,
     LinesDepthTint,
+    Solid,
     SolidDepthWrite,
     SolidDepthTint,
+    Font,
     Count,
 };
 
@@ -170,6 +173,104 @@ class BufferPage {
     }
 }
 
+class FontTexture {
+    private characters: string = '!"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~';
+    private font = `24px Consolas`;
+    public gpuTexture: GPUTexture;
+    public cellWidth: number;
+    public cellHeight: number;
+    public advanceX: number;
+    public advanceY: number;
+    public padding: number = 1;
+    public numCellsPerRow: number;
+    public fontParams = new Float32Array(4);
+
+    constructor(device: GPUDevice) {
+        this.rasterize(device);
+    }
+
+    public getCharacterIndex(c: string): number {
+        return this.characters.indexOf(c);
+    }
+
+    public getCellX(index: number): number {
+        return (index % this.numCellsPerRow);
+    }
+
+    public getCellY(index: number): number {
+        return (index / this.numCellsPerRow) | 0;
+    }
+
+    private rasterize(device: GPUDevice): void {
+        const canvas = document.createElement('canvas');
+        canvas.width = 256;
+        canvas.height = 256;
+        const ctx = canvas.getContext('2d')!;
+        ctx.font = this.font;
+
+        ctx.textAlign = `left`;
+        ctx.textBaseline = `top`;
+
+        ctx.fillStyle = `black`;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        let cellWidth = 0;
+        let cellHeight = 0;
+        for (const c of this.characters) {
+            const measure = ctx.measureText(c);
+            const w = Math.ceil(measure.actualBoundingBoxRight + measure.actualBoundingBoxLeft);
+            const h = Math.ceil(measure.actualBoundingBoxDescent + measure.actualBoundingBoxAscent);
+            cellWidth = Math.max(cellWidth, w);
+            cellHeight = Math.max(cellHeight, h);
+        }
+
+        this.advanceX = cellWidth;
+        this.advanceY = cellHeight;
+
+        // Padding
+        cellWidth += this.padding * 2;
+        cellHeight += this.padding * 2;
+
+        ctx.strokeStyle = `rgba(255, 255, 255, 0.5)`;
+        ctx.lineWidth = 3;
+        ctx.fillStyle = `rgba(255, 255, 255, 1.0)`;
+        const numCellsPerRow = (canvas.width / cellWidth) | 0;
+        let cellY = 0;
+        let cellX = 0;
+        for (const char of this.characters) {
+            ctx.strokeText(char, cellX * cellWidth + this.padding, cellY * cellHeight + this.padding);
+            ctx.fillText(char, cellX * cellWidth + this.padding, cellY * cellHeight + this.padding);
+            cellX++;
+    
+            if (cellX === numCellsPerRow) {
+                cellX = 0;
+                cellY++;
+            }
+        }
+
+        this.gpuTexture = device.createTexture({
+            size: canvas,
+            format: 'r8unorm',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+            label: `DebugFont`,
+        });
+
+        this.cellWidth = cellWidth;
+        this.cellHeight = cellHeight;
+        this.numCellsPerRow = numCellsPerRow;
+        this.fontParams[0] = cellWidth / canvas.width;
+        this.fontParams[1] = cellHeight / canvas.height;
+        this.fontParams[2] = this.padding / canvas.width;
+        this.fontParams[3] = this.padding / canvas.width;
+
+        device.queue.copyExternalImageToTexture({ source: canvas }, { texture: this.gpuTexture }, canvas);
+    }
+
+    public destroy(): void {
+        this.gpuTexture.destroy();
+    }
+}
+
 export class DebugDraw {
     private pages: BufferPage[] = [];
     private defaultPageVertexCount = 1024;
@@ -183,17 +284,24 @@ export class DebugDraw {
     private dummyDepthBuffer: GPUTexture;
     private debugDrawGPU: DebugDrawGPU;
     private lineThickness = 3;
+    private fontTexture: FontTexture;
+    private fontSampler: GPUSampler;
+    private screenWidth = 1;
+    private screenHeight = 1;
+    private screenPrintPos = vec2.create();
 
     public static scratchVec3 = [vec3.create(), vec3.create(), vec3.create(), vec3.create()];
 
     constructor(private device: GPUDevice, private colorTextureFormat: GPUTextureFormat) {
         this.shaderModule = this.createShaderModule();
-        this.uniformBuffer = device.createBuffer({ usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, size: 64+64+16, label: `DebugDraw Uniforms` });
+        this.uniformBuffer = device.createBuffer({ usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, size: 64+64+16+16, label: `DebugDraw Uniforms` });
 
         this.bindGroupLayout = device.createBindGroupLayout({
             entries: [
                 { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-                { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { } },
+                { binding: 3, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
             ],
             label: 'DebugDraw',
         });
@@ -207,7 +315,16 @@ export class DebugDraw {
 
         this.dummyDepthBuffer = device.createTexture({ format: 'depth24plus', size: [1, 1], usage: GPUTextureUsage.TEXTURE_BINDING });
 
+        this.fontTexture = new FontTexture(this.device);
         this.debugDrawGPU = new DebugDrawGPU(this, this.device);
+
+        this.fontSampler = device.createSampler({
+            addressModeU: `clamp-to-edge`,
+            addressModeV: `clamp-to-edge`,
+            minFilter: `linear`,
+            magFilter: `linear`,
+            label: `DebugDraw Font`,
+        })
     }
 
     public getGPUBuffer(): GPUBuffer {
@@ -219,26 +336,31 @@ export class DebugDraw {
 struct ViewData {
     clip_from_view: mat4x4f,
     view_from_world: mat4x4f,
-    misc: vec4f,
+    misc: vec4f, // screen_size_inv
+    font_params: vec4f, // cell_width, cell_height
 };
 
 @id(0) override behavior_type: u32 = ${BehaviorType.LinesDepthWrite};
 
 @group(0) @binding(0) var<uniform> view_data: ViewData;
-@group(0) @binding(1) var depth_buffer: texture_depth_2d;
+@group(0) @binding(1) var font_texture: texture_2d<f32>;
+@group(0) @binding(2) var font_sampler: sampler;
+@group(0) @binding(3) var depth_buffer: texture_depth_2d;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
     @location(0) color: vec4f,
-    @location(1) @interpolate(flat, either) flags: u32,
+    @location(1) uv: vec2f,
+    @location(2) @interpolate(flat, either) flags: u32,
 };
 
 @vertex
-fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f, @builtin(instance_index) instance_index: u32) -> VertexOutput {
-    // Flags are packed in the integer component of the alpha.
-    var flags = u32(color.a);
-
+fn main_vs(@location(0) position: vec3f, @location(1) color_: vec4f, @builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> VertexOutput {
     var out: VertexOutput;
+
+    // Flags are packed in the integer component of the alpha.
+    var color = color_;
+    var flags = u32(color.a);
 
     var space = flags & ${SpaceMask};
     if (space == ${DebugDrawFlags.WorldSpace}) {
@@ -246,11 +368,28 @@ fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f, @builtin(ins
     } else if (space == ${DebugDrawFlags.ViewSpace}) {
         out.position = view_data.clip_from_view * vec4f(position, 1.0f);
     } else if (space == ${DebugDrawFlags.ScreenSpace}) {
-        // Same as view-space, but we drop Z on the floor.
-        out.position = view_data.clip_from_view * vec4f(position.xy, 0.0f, 1.0f);
+        out.position = vec4f(position.xy, 0.1f, 1.0f);
     }
 
-    if (behavior_type == ${BehaviorType.LinesDepthTint} || behavior_type == ${BehaviorType.LinesDepthWrite}) {
+    if (behavior_type == ${BehaviorType.Font}) {
+        // Encoding for font characters is a bit silly. The color takes the range 0.0f - 1.0f,
+        //   index 0 has the range [0.0f, 1.0f]
+        //   index 1 has the range [2.0f, 3.0f]
+        var base = vec2i(color.rg);
+        var font_character_index = base / 2;
+
+        color.r = color.r - f32(font_character_index.x * 2);
+        color.g = color.g - f32(font_character_index.y * 2);
+
+        var tl_uv = vec2f(font_character_index) * view_data.font_params.xy + view_data.font_params.zw;
+        var br_uv = vec2f(font_character_index + vec2i(1, 1)) * view_data.font_params.xy - view_data.font_params.zw;
+
+        var quad_vertex = vertex_index & 3;
+        out.uv.x = select(tl_uv.x, br_uv.x, (quad_vertex == 1 || quad_vertex == 2));
+        out.uv.y = select(tl_uv.y, br_uv.y, (quad_vertex == 2 || quad_vertex == 3));
+    }
+
+    if (behavior_type == ${BehaviorType.Lines} || behavior_type == ${BehaviorType.LinesDepthTint} || behavior_type == ${BehaviorType.LinesDepthWrite}) {
         // Hacky thick line support.
         if (instance_index >= 1) {
             var line_idx = instance_index - 1;
@@ -274,6 +413,18 @@ fn main_vs(@location(0) position: vec3f, @location(1) color: vec4f, @builtin(ins
 fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     var color = vertex.color;
 
+    if (behavior_type == ${BehaviorType.Font}) {
+        var coverage = textureSample(font_texture, font_sampler, vertex.uv).r;
+        // Map range 0.0f - 0.5f to outline color (solid black), and 0.5f to 1.0f range to color.
+        var transparent = vec4f(0.0f, 0.0f, 0.0f, 0.0f);
+        var outline_color = vec4f(0.0f, 0.0f, 0.0f, 1.0f);
+        if (coverage > 0.5f) {
+            color = mix(outline_color, color, ((coverage - 0.5f) * 2.0f));
+        } else {
+            color = mix(transparent, outline_color, coverage * 2.0f);
+        }
+    }
+
     if (behavior_type == ${BehaviorType.LinesDepthTint} || behavior_type == ${BehaviorType.SolidDepthTint}) {
         // Do manual depth testing so we can do a depth tint.
         var depth = textureLoad(depth_buffer, vec2u(vertex.position.xy), 0);
@@ -292,7 +443,9 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     private createPipeline(behaviorType: BehaviorType): GPURenderPipeline {
         // Create the PSO based on our state.
         const isLines = behaviorType === BehaviorType.LinesDepthWrite || behaviorType === BehaviorType.LinesDepthTint;
+        const isDepthWrite = behaviorType === BehaviorType.LinesDepthWrite || behaviorType === BehaviorType.SolidDepthWrite;
         const isDepthTint = behaviorType === BehaviorType.LinesDepthTint || behaviorType === BehaviorType.SolidDepthTint;
+
         const desc: GPURenderPipelineDescriptor = {
             layout: this.pipelineLayout,
             primitive: {
@@ -326,7 +479,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
             depthStencil: isDepthTint ? undefined : {
                 format: 'depth24plus',
                 depthCompare: 'greater',
-                depthWriteEnabled: true,
+                depthWriteEnabled: isDepthWrite,
             },
             label: `DebugDraw ${BehaviorType[behaviorType]}`,
         };
@@ -334,20 +487,20 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
         return this.device.createRenderPipeline(desc);
     }
 
-    private getBehaviorType(isLines: boolean, options: DebugDrawOptions) {
+    private getBehaviorType(isLines: boolean, isOpaque: boolean, options: DebugDrawOptions) {
         const isDepthTint = options.flags & DebugDrawFlags.DepthTint;
         if (isLines)
-            return isDepthTint ? BehaviorType.LinesDepthTint : BehaviorType.LinesDepthWrite;
+            return isDepthTint ? BehaviorType.LinesDepthTint : isOpaque ? BehaviorType.LinesDepthWrite : BehaviorType.Lines;
         else
-            return isDepthTint ? BehaviorType.SolidDepthTint : BehaviorType.SolidDepthWrite;
+            return isDepthTint ? BehaviorType.SolidDepthTint : isOpaque ? BehaviorType.SolidDepthWrite : BehaviorType.Lines;
     }
 
     private beginBatch(behaviorType: BehaviorType, vertexCount: number, indexCount: number): void {
         this.currentPage = this.findPage(behaviorType, vertexCount, indexCount);
     }
 
-    public beginBatchLine(numSegments: number, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const behaviorType = this.getBehaviorType(true, options);
+    public beginBatchLine(numSegments: number, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
+        const behaviorType = this.getBehaviorType(true, color.a >= 1.0, options);
         this.beginBatch(behaviorType, numSegments * 2, numSegments * 2);
     }
 
@@ -377,7 +530,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawLine(p0: ReadonlyVec3, p1: ReadonlyVec3, color0: GfxColor, color1 = color0, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(this.getBehaviorType(true, options), 2, 2);
+        const page = this.findPage(this.getBehaviorType(true, color0.a >= 1.0 && color1.a >= 1.0, options), 2, 2);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(p0, color0, options);
@@ -393,7 +546,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawBasis(m: ReadonlyMat4, mag = 100, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(this.getBehaviorType(true, options), 6, 6);
+        const page = this.findPage(this.getBehaviorType(true, true, options), 6, 6);
 
         const baseVertex = page.getCurrentVertexID();
         mat4.getTranslation(DebugDraw.scratchVec3[0], m);
@@ -421,7 +574,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawLocator(center: ReadonlyVec3, mag: number, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(this.getBehaviorType(true, options), 6, 6);
+        const page = this.findPage(this.getBehaviorType(true, color.a >= 1.0, options), 6, 6);
 
         const baseVertex = page.getCurrentVertexID();
         for (let i = 0; i < 3; i++) {
@@ -444,7 +597,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawDiscLineRU(center: ReadonlyVec3, right: ReadonlyVec3, up: ReadonlyVec3, r: number, color: GfxColor, sides = 32, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(this.getBehaviorType(true, options), sides, sides * 2);
+        const page = this.findPage(this.getBehaviorType(true, color.a >= 1.0, options), sides, sides * 2);
 
         const baseVertex = page.getCurrentVertexID();
         const s = DebugDraw.scratchVec3[2];
@@ -473,7 +626,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawDiscSolidRU(center: ReadonlyVec3, right: ReadonlyVec3, up: ReadonlyVec3, r: number, color: GfxColor, sides = 32, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(this.getBehaviorType(false, options), sides + 1, sides * 3);
+        const page = this.findPage(this.getBehaviorType(false, color.a >= 1.0, options), sides + 1, sides * 3);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(center, color, options);
@@ -511,7 +664,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawTriSolidP(p0: ReadonlyVec3, p1: ReadonlyVec3, p2: ReadonlyVec3, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(this.getBehaviorType(false, options), 3, 3);
+        const page = this.findPage(this.getBehaviorType(false,color.a >= 1.0,  options), 3, 3);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(p0, color, options);
@@ -523,7 +676,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawRectLineP(p0: ReadonlyVec3, p1: ReadonlyVec3, p2: ReadonlyVec3, p3: ReadonlyVec3, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(this.getBehaviorType(true, options), 4, 8);
+        const page = this.findPage(this.getBehaviorType(true, color.a >= 1.0, options), 4, 8);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(p0, color, options);
@@ -543,7 +696,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     }
 
     public drawRectSolidP(p0: ReadonlyVec3, p1: ReadonlyVec3, p2: ReadonlyVec3, p3: ReadonlyVec3, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
-        const page = this.findPage(this.getBehaviorType(false, options), 4, 6);
+        const page = this.findPage(this.getBehaviorType(false, color.a >= 1.0, options), 4, 6);
 
         const baseVertex = page.getCurrentVertexID();
         page.vertexPCF(p0, color, options);
@@ -562,6 +715,75 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     public drawRectSolidRU(center: ReadonlyVec3, right: ReadonlyVec3, up: ReadonlyVec3, rightMag: number, upMag: number, color: GfxColor, options: DebugDrawOptions = { flags: DebugDrawFlags.Default }): void {
         this.rectCorner(DebugDraw.scratchVec3, center, right, up, rightMag, upMag);
         this.drawRectSolidP(DebugDraw.scratchVec3[0], DebugDraw.scratchVec3[1], DebugDraw.scratchVec3[2], DebugDraw.scratchVec3[3], color, options);
+    }
+
+    // TODO(jstpierre): Clean this up and make it more generic.
+    public screenPrintText(s: string, size: number = 1, color: GfxColor = White): void {
+        const numQuads = s.length;
+        const page = this.findPage(BehaviorType.Font, numQuads * 4, numQuads * 6);
+
+        const options = { flags: DebugDrawFlags.ScreenSpace };
+
+        let baseVertex = page.getCurrentVertexID();
+
+        const advanceX = size * this.fontTexture.advanceX;
+        const advanceY = size * this.fontTexture.advanceY;
+
+        const sizeX = advanceX / this.screenWidth * 2;
+        const sizeY = -advanceY / this.screenHeight * 2;
+
+        const x = this.screenPrintPos[0] / this.screenWidth * 2 - 1;
+        const y = this.screenPrintPos[1] / this.screenHeight * -2 + 1;
+
+        const p = vec3.set(DebugDraw.scratchVec3[0], x, y, 0.0);
+        const colorR = color.r;
+        const colorG = color.g;
+        for (let i = 0; i < numQuads; i++) {
+            const char = s.charAt(i);
+            if (char === '\n') {
+                p[0] = x;
+                p[1] += sizeY;
+                this.screenPrintPos[1] += advanceY;
+                continue;
+            }
+
+            const index = this.fontTexture.getCharacterIndex(char);
+
+            if (index >= 0) {
+                const cellX = this.fontTexture.getCellX(index);
+                const cellY = this.fontTexture.getCellY(index);
+                color.r = colorR + cellX * 2;
+                color.g = colorG + cellY * 2;
+
+                // TL, TR, BR, BL
+                page.vertexPCF(p, color, options);
+
+                vec3.copy(DebugDraw.scratchVec3[1], p);
+                DebugDraw.scratchVec3[1][0] += sizeX;
+                page.vertexPCF(DebugDraw.scratchVec3[1], color, options);
+
+                DebugDraw.scratchVec3[1][1] += sizeY;
+                page.vertexPCF(DebugDraw.scratchVec3[1], color, options);
+
+                vec3.copy(DebugDraw.scratchVec3[1], p);
+                DebugDraw.scratchVec3[1][1] += sizeY;
+                page.vertexPCF(DebugDraw.scratchVec3[1], color, options);
+
+                page.index(baseVertex + 0);
+                page.index(baseVertex + 1);
+                page.index(baseVertex + 2);
+                page.index(baseVertex + 0);
+                page.index(baseVertex + 2);
+                page.index(baseVertex + 3);
+                baseVertex += 4;
+            }
+
+            p[0] += sizeX;
+        }
+
+        color.r = colorR;
+        color.g = colorG;
+        this.screenPrintPos[1] += advanceY;
     }
 
     private uploadPages(): number {
@@ -598,11 +820,15 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
         }
     }
 
-    public beginFrame(mouseX: number, mouseY: number, mouseButtons: number): void {
+    public beginFrame(screenWidth: number, screenHeight: number, mouseX: number, mouseY: number, mouseButtons: number): void {
+        this.screenWidth = screenWidth;
+        this.screenHeight = screenHeight;
+        // Initialize to 10, 10
+        vec2.set(this.screenPrintPos, 10, 10);
         this.debugDrawGPU.beginFrame(mouseX, mouseY, mouseButtons);
     }
 
-    public endFrame(cmd: GPUCommandEncoder, clipFromViewMatrix: ReadonlyMat4, viewFromWorldMatrix: ReadonlyMat4, width: number, height: number, colorTextureView: GPUTextureView, depthTextureView: GPUTextureView): void {
+    public endFrame(cmd: GPUCommandEncoder, clipFromViewMatrix: ReadonlyMat4, viewFromWorldMatrix: ReadonlyMat4, colorTextureView: GPUTextureView, depthTextureView: GPUTextureView): void {
         this.debugDrawGPU.endFrame(cmd);
 
         const behaviorTypes = this.uploadPages();
@@ -612,17 +838,20 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
         const data = new Float32Array(this.uniformBuffer.size / 4);
         data.set(clipFromViewMatrix, 0);
         data.set(viewFromWorldMatrix, 16);
-        data[32] = 1 / width;
-        data[33] = 1 / height;
+        data[32] = 1 / this.screenWidth;
+        data[33] = 1 / this.screenHeight;
+        data.set(this.fontTexture.fontParams, 36);
         this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
 
         // First, check if we have any solid stuff (needs proper depth).
-        if (behaviorTypes & ((1 << BehaviorType.LinesDepthWrite) | (1 << BehaviorType.SolidDepthWrite))) {
+        if (behaviorTypes & ((1 << BehaviorType.Lines) | (1 << BehaviorType.LinesDepthWrite) | (1 << BehaviorType.Solid) | (1 << BehaviorType.SolidDepthWrite) | (1 << BehaviorType.Font))) {
             const bindGroup = this.device.createBindGroup({
                 layout: this.bindGroupLayout,
                 entries: [
                     { binding: 0, resource: { buffer: this.uniformBuffer } },
-                    { binding: 1, resource: this.dummyDepthBuffer.createView() },
+                    { binding: 1, resource: this.fontTexture.gpuTexture.createView() },
+                    { binding: 2, resource: this.fontSampler },
+                    { binding: 3, resource: this.dummyDepthBuffer.createView() },
                 ],
                 label: `DebugDraw DepthWrite`,
             });
@@ -634,7 +863,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
             });
 
             renderPass.setBindGroup(0, bindGroup);
-            this.drawPages(renderPass, (1 << BehaviorType.LinesDepthWrite) | (1 << BehaviorType.SolidDepthWrite));
+            this.drawPages(renderPass, (1 << BehaviorType.Lines) | (1 << BehaviorType.LinesDepthWrite) | (1 << BehaviorType.Solid) | (1 << BehaviorType.SolidDepthWrite) | (1 << BehaviorType.Font));
             renderPass.end();
         }
 
@@ -643,7 +872,9 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
                 layout: this.bindGroupLayout,
                 entries: [
                     { binding: 0, resource: { buffer: this.uniformBuffer } },
-                    { binding: 1, resource: depthTextureView },
+                    { binding: 1, resource: this.fontTexture.gpuTexture.createView() },
+                    { binding: 2, resource: this.fontSampler },
+                    { binding: 3, resource: depthTextureView },
                 ],
                 label: `DebugDraw DepthTint`,
             });
@@ -724,6 +955,30 @@ class DebugDrawGPU {
                     this.debugDraw.drawLocator(p0, mag, color, { flags });
                 }
                 break;
+            case DebugDrawMessageType.screenPrintFloat1:
+                {
+                    const v0 = view.getFloat32(offs++ * 4, true);
+                    this.debugDraw.screenPrintText(`${v0.toFixed(2)}`);
+                }
+                break;
+            case DebugDrawMessageType.screenPrintFloat2:
+                {
+                    const v0 = view.getFloat32(offs++ * 4, true), v1 = view.getFloat32(offs++ * 4, true);
+                    this.debugDraw.screenPrintText(`${v0.toFixed(2)}, ${v1.toFixed(2)}`);
+                }
+                break;
+            case DebugDrawMessageType.screenPrintFloat3:
+                {
+                    const v0 = view.getFloat32(offs++ * 4, true), v1 = view.getFloat32(offs++ * 4, true), v2 = view.getFloat32(offs++ * 4, true);
+                    this.debugDraw.screenPrintText(`${v0.toFixed(2)}, ${v1.toFixed(2)}, ${v2.toFixed(2)}`);
+                }
+                break;
+            case DebugDrawMessageType.screenPrintFloat4:
+                {
+                    const v0 = view.getFloat32(offs++ * 4, true), v1 = view.getFloat32(offs++ * 4, true), v2 = view.getFloat32(offs++ * 4, true), v3 = view.getFloat32(offs++ * 4, true);
+                    this.debugDraw.screenPrintText(`${v0.toFixed(2)}, ${v1.toFixed(2)}, ${v2.toFixed(2)}, ${v3.toFixed(2)}`);
+                }
+                break;
             }
         }
     }
@@ -791,6 +1046,10 @@ const enum DebugDrawMessageType {
     drawLine,
     drawSphere,
     drawLocator,
+    screenPrintFloat1,
+    screenPrintFloat2,
+    screenPrintFloat3,
+    screenPrintFloat4,
 }
 
 export const gpuShaderCode = `
@@ -892,5 +1151,35 @@ fn DebugDraw_drawLocator(p0: vec3f, mag: f32, color0: vec4f) {
     gDebugDraw_buffer.data[offs + 6u] = bitcast<u32>(color0.y);
     gDebugDraw_buffer.data[offs + 7u] = bitcast<u32>(color0.z);
     gDebugDraw_buffer.data[offs + 8u] = bitcast<u32>(color0.w);
+}
+
+fn DebugDraw_screenPrintFloat1(v: f32) {
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 2u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.screenPrintFloat1};
+    gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(v);
+}
+
+fn DebugDraw_screenPrintFloat2(v: vec2f) {
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 3u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.screenPrintFloat2};
+    gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(v.x);
+    gDebugDraw_buffer.data[offs + 2u] = bitcast<u32>(v.y);
+}
+
+fn DebugDraw_screenPrintFloat3(v: vec3f) {
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 4u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.screenPrintFloat3};
+    gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(v.x);
+    gDebugDraw_buffer.data[offs + 2u] = bitcast<u32>(v.y);
+    gDebugDraw_buffer.data[offs + 3u] = bitcast<u32>(v.z);
+}
+
+fn DebugDraw_screenPrintFloat4(v: vec4f) {
+    var offs = atomicAdd(&gDebugDraw_buffer.size, 5u);
+    gDebugDraw_buffer.data[offs + 0u] = ${DebugDrawMessageType.screenPrintFloat4};
+    gDebugDraw_buffer.data[offs + 1u] = bitcast<u32>(v.x);
+    gDebugDraw_buffer.data[offs + 2u] = bitcast<u32>(v.y);
+    gDebugDraw_buffer.data[offs + 3u] = bitcast<u32>(v.z);
+    gDebugDraw_buffer.data[offs + 4u] = bitcast<u32>(v.w);
 }
 `;
