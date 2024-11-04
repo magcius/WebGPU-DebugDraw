@@ -166,10 +166,22 @@ class MouseTracker {
     }
 
     private update(e: MouseEvent): void {
-        this.x = e.offsetX;
-        this.y = e.offsetY;
+        this.x = e.offsetX * window.devicePixelRatio;
+        this.y = e.offsetY * window.devicePixelRatio;
         this.buttons = e.buttons;
     }
+}
+
+export function resizeCanvas(canvas: HTMLCanvasElement, width: number, height: number, devicePixelRatio: number): void {
+    const nw = width * devicePixelRatio;
+    const nh = height * devicePixelRatio;
+    if (canvas.width === nw && canvas.height === nh)
+        return;
+
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    canvas.width = nw;
+    canvas.height = nh;
 }
 
 class Main {
@@ -187,13 +199,21 @@ class Main {
 
     constructor() {
         this.canvas = document.createElement('canvas');
-        this.canvas.width = 1920;
-        this.canvas.height = 1080;
 
         document.body.appendChild(this.canvas);
 
         this.mouseTracker = new MouseTracker(this.canvas);
         this.init();
+    }
+
+    private _onResize() {
+        resizeCanvas(this.canvas, window.innerWidth, window.innerHeight, window.devicePixelRatio);
+        
+        this.depthBuffer = this.device.createTexture({ 
+            size: [this.canvas.width, this.canvas.height],
+            format: 'depth24plus',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        })
     }
 
     private async init() {
@@ -208,15 +228,12 @@ class Main {
         this.ctx = this.canvas.getContext('webgpu') as GPUCanvasContext;
         this.ctx.configure({ device, format: colorTextureFormat });
 
-        this.depthBuffer = device.createTexture({ 
-            size: [this.canvas.width, this.canvas.height],
-            format: 'depth24plus',
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-        })
-
         this.debugDraw = new DebugDraw(device, colorTextureFormat);
 
         this.plane = new Plane(device, colorTextureFormat, this.debugDraw);
+
+        window.onresize = this._onResize.bind(this);
+        this._onResize();
 
         requestAnimationFrame(this.update);
     }
