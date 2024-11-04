@@ -177,14 +177,9 @@ class FontTexture {
     private characters: string = '!"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~';
     private font = `24px Consolas`;
     public gpuTexture: GPUTexture;
-    public cellWidth: number;
-    public cellHeight: number;
     public advanceX: number;
     public advanceY: number;
     public strokeWidth = 3;
-    public padding: number = 1;
-    public numCellsPerRow: number;
-    public fontParams = new Float32Array(4);
 
     constructor(device: GPUDevice) {
         this.rasterize(device);
@@ -194,26 +189,12 @@ class FontTexture {
         return this.characters.indexOf(c);
     }
 
-    public getCellX(index: number): number {
-        return (index % this.numCellsPerRow);
-    }
-
-    public getCellY(index: number): number {
-        return (index / this.numCellsPerRow) | 0;
-    }
-
     private rasterize(device: GPUDevice): void {
         const canvas = document.createElement('canvas');
-        canvas.width = 256;
-        canvas.height = 256;
         const ctx = canvas.getContext('2d')!;
         ctx.font = this.font;
-
         ctx.textAlign = `left`;
         ctx.textBaseline = `top`;
-
-        ctx.fillStyle = `black`;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
 
         let cellWidth = 0;
         let cellHeight = 0;
@@ -229,43 +210,37 @@ class FontTexture {
         this.advanceY = cellHeight;
 
         // Padding
-        const extra = this.padding + this.strokeWidth * 0.5;
+        const extra = this.strokeWidth * 0.5;
         cellWidth += extra * 2;
         cellHeight += extra * 2;
 
-        ctx.strokeStyle = `rgba(255, 255, 255, 0.5)`;
-        ctx.lineWidth = this.strokeWidth;
-        ctx.fillStyle = `rgba(255, 255, 255, 1.0)`;
-        const numCellsPerRow = (canvas.width / cellWidth) | 0;
-        let cellY = 0;
-        let cellX = 0;
-        for (const char of this.characters) {
-            ctx.strokeText(char, cellX * cellWidth + extra, cellY * cellHeight + extra);
-            ctx.fillText(char, cellX * cellWidth + extra, cellY * cellHeight + extra);
-            cellX++;
-    
-            if (cellX === numCellsPerRow) {
-                cellX = 0;
-                cellY++;
-            }
-        }
+        canvas.width = cellWidth;
+        canvas.height = cellHeight;
 
         this.gpuTexture = device.createTexture({
-            size: canvas,
+            size: [cellWidth, cellHeight, this.characters.length],
             format: 'r8unorm',
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
             label: `DebugFont`,
         });
 
-        this.cellWidth = cellWidth;
-        this.cellHeight = cellHeight;
-        this.numCellsPerRow = numCellsPerRow;
-        this.fontParams[0] = cellWidth / canvas.width;
-        this.fontParams[1] = cellHeight / canvas.height;
-        this.fontParams[2] = this.padding / canvas.width;
-        this.fontParams[3] = this.padding / canvas.width;
+        ctx.font = this.font;
+        ctx.textAlign = `left`;
+        ctx.textBaseline = `top`;
 
-        device.queue.copyExternalImageToTexture({ source: canvas }, { texture: this.gpuTexture }, canvas);
+        ctx.strokeStyle = `rgba(255, 255, 255, 0.5)`;
+        ctx.lineWidth = this.strokeWidth;
+        for (let i = 0; i < this.characters.length; i++) {
+            ctx.fillStyle = `black`;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const char = this.characters[i];
+            ctx.fillStyle = `rgba(255, 255, 255, 1.0)`;
+            ctx.strokeText(char, extra, extra);
+            ctx.fillText(char, extra, extra);
+
+            device.queue.copyExternalImageToTexture({ source: canvas }, { texture: this.gpuTexture, origin: [0, 0, i] }, canvas);
+        }
     }
 
     public destroy(): void {
@@ -296,12 +271,12 @@ export class DebugDraw {
 
     constructor(private device: GPUDevice, private colorTextureFormat: GPUTextureFormat) {
         this.shaderModule = this.createShaderModule();
-        this.uniformBuffer = device.createBuffer({ usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, size: 64+64+16+16, label: `DebugDraw Uniforms` });
+        this.uniformBuffer = device.createBuffer({ usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, size: 64+64+16, label: `DebugDraw Uniforms` });
 
         this.bindGroupLayout = device.createBindGroupLayout({
             entries: [
                 { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: '2d-array' } },
                 { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { } },
                 { binding: 3, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
             ],
@@ -339,20 +314,19 @@ struct ViewData {
     clip_from_view: mat4x4f,
     view_from_world: mat4x4f,
     misc: vec4f, // screen_size_inv
-    font_params: vec4f, // cell_width, cell_height
 };
 
 @id(0) override behavior_type: u32 = ${BehaviorType.LinesDepthWrite};
 
 @group(0) @binding(0) var<uniform> view_data: ViewData;
-@group(0) @binding(1) var font_texture: texture_2d<f32>;
+@group(0) @binding(1) var font_texture: texture_2d_array<f32>;
 @group(0) @binding(2) var font_sampler: sampler;
 @group(0) @binding(3) var depth_buffer: texture_depth_2d;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
     @location(0) color: vec4f,
-    @location(1) uv: vec2f,
+    @location(1) uv: vec3f,
     @location(2) @interpolate(flat, either) flags: u32,
 };
 
@@ -377,18 +351,15 @@ fn main_vs(@location(0) position: vec3f, @location(1) color_: vec4f, @builtin(ve
         // Encoding for font characters is a bit silly. The color takes the range 0.0f - 1.0f,
         //   index 0 has the range [0.0f, 1.0f]
         //   index 1 has the range [2.0f, 3.0f]
-        var base = vec2i(color.rg);
+        var base = i32(color.r);
         var font_character_index = base / 2;
 
-        color.r = color.r - f32(font_character_index.x * 2);
-        color.g = color.g - f32(font_character_index.y * 2);
-
-        var tl_uv = vec2f(font_character_index) * view_data.font_params.xy + view_data.font_params.zw;
-        var br_uv = vec2f(font_character_index + vec2i(1, 1)) * view_data.font_params.xy - view_data.font_params.zw;
+        color.r = color.r - f32(font_character_index * 2);
 
         var quad_vertex = vertex_index & 3;
-        out.uv.x = select(tl_uv.x, br_uv.x, (quad_vertex == 1 || quad_vertex == 2));
-        out.uv.y = select(tl_uv.y, br_uv.y, (quad_vertex == 2 || quad_vertex == 3));
+        out.uv.x = select(0.0f, 1.0f, (quad_vertex == 1 || quad_vertex == 2));
+        out.uv.y = select(0.0f, 1.0f, (quad_vertex == 2 || quad_vertex == 3));
+        out.uv.z = f32(font_character_index);
     }
 
     if (behavior_type == ${BehaviorType.Lines} || behavior_type == ${BehaviorType.LinesDepthTint} || behavior_type == ${BehaviorType.LinesDepthWrite}) {
@@ -416,7 +387,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
     var color = vertex.color;
 
     if (behavior_type == ${BehaviorType.Font}) {
-        var coverage = textureSample(font_texture, font_sampler, vertex.uv).r;
+        var coverage = textureSample(font_texture, font_sampler, vertex.uv.xy, i32(vertex.uv.z)).r;
         // Map range 0.0f - 0.5f to outline color (solid black), and 0.5f to 1.0f range to color.
         var transparent = vec4f(0.0f, 0.0f, 0.0f, 0.0f);
         var outline_color = vec4f(0.0f, 0.0f, 0.0f, 1.0f);
@@ -752,10 +723,7 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
             const index = this.fontTexture.getCharacterIndex(char);
 
             if (index >= 0) {
-                const cellX = this.fontTexture.getCellX(index);
-                const cellY = this.fontTexture.getCellY(index);
-                color.r = colorR + cellX * 2;
-                color.g = colorG + cellY * 2;
+                color.r = colorR + index * 2;
 
                 // TL, TR, BR, BL
                 page.vertexPCF(p, color, options);
@@ -842,7 +810,6 @@ fn main_ps(vertex: VertexOutput) -> @location(0) vec4f {
         data.set(viewFromWorldMatrix, 16);
         data[32] = 1 / this.screenWidth;
         data[33] = 1 / this.screenHeight;
-        data.set(this.fontTexture.fontParams, 36);
         this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
 
         // First, check if we have any solid stuff (needs proper depth).
